@@ -1,0 +1,3 @@
+VER="Exo4.7"
+OS_TITLE="DarkMatter"
+INSTALL_PREFIX="$OS_TITLE-$VER"
