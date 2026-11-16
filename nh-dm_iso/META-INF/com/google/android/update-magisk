@@ -1,0 +1,631 @@
+## [Magisk & KernelSU] [nethunter] [This is sourced, not a standalone script]
+## Kali NetHunter installation script for Magisk / KernelSU
+##
+## REF: https://topjohnwu.github.io/Magisk/guides.html
+##      https://github.com/topjohnwu/Magisk/blob/master/scripts/update_binary.sh
+##      https://github.com/topjohnwu/Magisk/blob/master/scripts/util_functions.sh
+##
+## Troubleshoot: Save log via Magisk && $ adb shell 'cat /sdcard/Download/magisk_install_log_*.log; rm /sdcard/Download/magisk_install_log_*.log'
+
+## $KSU_INSTALL is exported by update-binary: true when running under
+## KernelSU's module installer shim (ksud installer.sh), which already
+## provides ui_print, abort, set_perm*, mktouch, grep_prop,
+## api_level_arch_detect, mount_partitions, boot_actions, and
+## MAGISK_VER/MAGISK_VER_CODE compatibility variables.
+
+symlink() {
+  ln -sf "$1" "$2" 2>/dev/null
+  chmod 0755 $2 2>/dev/null
+}
+
+do_flash() {
+  ui_print "* Found Kali kernel to be installed: $KERNEL"
+  unzip -p "$ZIPFILE" "$KERNEL" > "$KERNEL" || print "! Failed to extract"
+
+  ## KernelSU: kernel flashing from inside a module install is not supported.
+  ## The bundled kernel zip is AnyKernel3-based and can be flashed directly
+  ## from the KernelSU (Next) manager: "Flash AnyKernel Zip".
+  if $KSU_INSTALL; then
+    ui_print "  - Kernel flashing is skipped under KernelSU"
+    ui_print "  - Flash $KERNEL via the manager's 'Flash AnyKernel Zip' instead"
+    return 0
+  fi
+
+  ## #1 - Down side the output isn't formatted
+  #sh $TMP/tools/magic-flash.sh $KERNEL 2>&1 || abort "! magic-flash.sh failed"
+
+  ## #2 - Down side not sure if it exits cleanly
+  ## Replace ui_print, indent output (to signal its a script) and remove empty lines
+  sh $TMP/tools/magic-flash.sh $KERNEL | awk 'gsub(/ui_print /," ") && !/^ $/'
+
+  ## #3 - Down side the output isn't in real time
+  #OUT=$( sh $TMP/tools/magic-flash.sh $KERNEL 2>&1 )
+  #ret=$?
+  #if [ "$ret" -eq 0 ]; then
+  #  ## Replace ui_print, indent output (to signal its a script) and remove empty lines
+  #  echo "${OUT}" | awk 'gsub(/ui_print /," ") && !/^ $/'
+  #else
+  #  echo "${OUT}"   # Will be much more verbose
+  #  abort "! magic-flash.sh failed: $ret"
+  #fi
+
+  ## #4 - Can't do this bash trick, as using sh (shell)
+  ## Replace ui_print, indent output (to signal its a script) and remove empty lines
+  #sh $TMP/tools/magic-flash.sh $KERNEL 2>&1 | awk 'gsub(/ui_print /," ") && !/^ $/'   # Spawn a new session (aka using sh), don't do it in the current session
+  #ret=${PIPESTATUS[0]}   # We want magic-flash.sh exit code, not awk!
+  #[ "$ret" -eq 0 ] || abort "! magic-flash.sh failed: $ret"
+
+  ## If script wasn't sourced, would it still be an issue?
+}
+
+flash_kernel() {
+  [ -e "$ZIPFILE" ] && {
+    ## Check zip for kernel-nethunter.zip
+    KERNEL=$(unzip -lqq "$ZIPFILE" | awk '$4 ~ /^kernel-nethunter/ { print $4; exit }')
+    ## If zip didn't contain a kernel-*.zip
+    [ "$KERNEL" ] || {
+      ui_print "* No kernel found. Skipping"
+      return
+    }
+    do_flash || abort "! flash_kernel failed"
+  }
+}
+
+push_modules() {
+   [ ! -d "$TMP/boot-patcher/modules" ] && {
+      ui_print "  - No modules to push, skipping"
+      return
+   }
+   NHMODULES_DIR=`ls "$TMP/boot-patcher/modules/"`   
+   ui_print "  - Copying modules"
+   cp -r "$TMP/boot-patcher/modules/$NHMODULES_DIR/lib" "$MODPATH/system/"   
+   ui_print "  - Verifying modules folder"
+   if [ -d "$MODPATH/system/lib/modules" ]; then
+     ui_print "  - Modules copied successfully to /system/lib/modules."
+   else
+     abort "- Failed to copy modules to /system/lib/modules."
+   fi
+}
+
+#------------------------------------------------------------------------------
+
+#<REF: ./scripts/util_functions.sh>
+#########################
+# Install module
+#########################
+## KernelSU: keep the shim's $TMPDIR (under /data, persistent and large);
+## Magisk's /dev/tmp is a tmpfs that may be too small for the unpack step.
+if ! $KSU_INSTALL; then
+  TMPDIR=/dev/tmp
+fi
+rm -rf $TMPDIR/nethunter
+mkdir -p $TMPDIR
+chcon u:object_r:system_file:s0 $TMPDIR
+cd $TMPDIR
+
+if ! $KSU_INSTALL; then
+  setup_flashable
+  mount_partitions || true
+  api_level_arch_detect
+
+  ## Setup BusyBox and binaries
+  boot_actions
+fi
+
+## Extract prop file
+unzip -o "$ZIPFILE" module.prop -d $TMPDIR >&2 || print "! Failed to extract"
+[ ! -f $TMPDIR/module.prop ] && abort "! Unable to extract zip file!"
+
+## Extract post-fs-data script
+unzip -o "$ZIPFILE" post-fs-data.sh -d $TMPDIR >&2
+[ ! -f $TMPDIR/module.prop ] && abort "! Unable to extract zip file!"
+
+MODDIRNAME=modules_update
+MODULEROOT=/data/adb/$MODDIRNAME
+MODID=$(grep_prop id $TMPDIR/module.prop)
+MODNAME=$(grep_prop name $TMPDIR/module.prop)
+MODAUTH=$(grep_prop author $TMPDIR/module.prop)
+## KernelSU: keep the shim-provided $MODPATH (/data/adb/modules_update/<id>,
+## already populated with the extracted module)
+if ! $KSU_INSTALL; then
+  MODPATH=$MODULEROOT/$MODID
+fi
+
+## Create mod paths
+## KernelSU: MODPATH was already created by the installer shim and contains
+## the extracted module (minus META-INF/*); don't wipe it here, our staged
+## files land inside $MODPATH/system below.
+if ! $KSU_INSTALL; then
+  rm -rf $MODPATH
+fi
+mkdir -p $MODPATH || abort "! Unable to: mkdir -p $MODPATH"
+#</REF: ./scripts/util_functions.sh>
+
+## Define several variables
+[ -z "$TMPDIR" ] && TMPDIR=/dev/tmp
+[ -n "${ZIP:-}" ] && { ZIPFILE="$ZIP"; unset ZIP; }
+[ -z "$ZIPFILE" ] && ZIPFILE="${3:-}"
+DIR=$(dirname "$ZIPFILE")
+TMP=$TMPDIR/$MODID
+
+## Magisk manager/booted flashing support
+## KernelSU: the shim exports OUTFD (stdout pipe); don't clobber it
+OUTFD=${OUTFD:-/proc/self/fd/0}
+if $KSU_INSTALL; then
+  ## KernelSU: ksud's installer shim already prepends its busybox to PATH
+  [ -e /data/adb/ksu/bin/busybox ] && export PATH="/data/adb/ksu/bin/busybox:$PATH"
+elif [ -e /data/adb/magisk ]; then
+  ADB=adb
+  if [ -e /data/$ADB/magisk ]; then
+    [ -e /magisk/.core/busybox ] && MAGISKBB=/magisk/.core/busybox
+    [ -e /sbin/.core/busybox ] && MAGISKBB=/sbin/.core/busybox
+    [ -e /sbin/.magisk/busybox ] && MAGISKBB=/sbin/.magisk/busybox
+    [ -e /dev/*/.magisk/busybox ] && MAGISKBB=$(echo /dev/*/.magisk/busybox)
+    [ -e /data/$ADB/ksu/bin/busybox ] && MAGISKBB=/data/$ADB/ksu/bin/busybox
+    [ -e /data/$ADB/ap/bin/busybox ] && MAGISKBB=/data/$ADB/ap/bin/busybox
+    [ "$MAGISKBB" ] && export PATH="$MAGISKBB:$PATH"
+    [ "$MAGISKBB" ] \
+      && debug "MAGISKBB: $MAGISKBB" \
+      || debug "Inside of Magisk without BusyBox"
+  elif [ ! -f "$MAGISKBB" ]; then
+    debug "Not inside of Magisk?"
+  fi
+fi
+
+## Define modules target dirs
+if [ -e /data/adb/modules ]; then
+  MNT=/data/adb/modules_update
+  MAGISK=/$MODID/system
+fi
+
+## Set target paths
+## KernelSU: keep the shim-provided $MODPATH (it is where the module was
+## extracted and where the manager expects the module to live).
+if ! $KSU_INSTALL; then
+  [ ! -z $MODPTH ] || MODPATH=$MNT/$MODID
+fi
+TARGET=$MODPATH/system
+ETC=$TARGET/etc
+BIN=$TARGET/bin
+
+if [ -d /system/xbin ]; then
+  XBIN=$TARGET/xbin
+else
+  XBIN=$TARGET/bin
+fi
+
+if [ -d /system/media ]; then
+  MEDIA=$TARGET/media
+elif [ -d /system/product/media ]; then
+  MEDIA=$TARGET/product/media
+fi
+
+UMASK=$(umask)
+umask 022
+
+#------------------------------------------------------------------------------
+
+## Ensure zip installer shell is in a working scratch directory
+mkdir -p $TMPDIR
+cd $TMPDIR
+
+## Source custom installer functions and configuration
+#unzip -o "$ZIPFILE" module.prop -d $TMPDIR >&2 || print "! Failed to extract"
+#MODID=$(file_getprop module.prop id) # Alt: MODID=$(grep_prop id $TMPDIR/module.prop)
+
+## Extract the ZIP
+ui_print "* Unpacking ZIP"
+mkdir -p $TMPDIR/$MODID
+cd $TMPDIR/$MODID
+## Unpack the ZIP (everything but "kalifs-*")
+unzip -qq "$ZIPFILE" -x "kalifs-*" || print "! Failed to extract"
+#ui_print "* ZIP unpacked"
+
+#------------------------------------------------------------------------------
+
+## Setup environment before installations
+##   KernelSU: no remount needed - everything lands in the module overlay
+##             ($MODPATH/system) and the manager handles the rest.
+##   Magisk:   Mount System as r/w just in case we need it.
+ui_print "* Setting environment"
+DYNAMIC=false
+SAR=false
+if ! $KSU_INSTALL; then
+  if [ -d /dev/block/mapper ]; then
+    for block in system; do
+      for slot in "" _a _b; do
+        blockdev --setrw /dev/block/mapper/$block$slot 2>/dev/null
+      done
+    done
+    DYNAMIC=true
+  fi
+  mount -o rw,remount -t auto /system || mount /system || true
+  [ $? != 0 ] && mount -o rw,remount -t auto / && SAR=true
+fi
+
+## Additional setup for installing apps via pm
+if [ "$(getenforce)" = "Enforcing" ]; then ENFORCE=true; else ENFORCE=false; fi
+$ENFORCE && setenforce 0
+VERIFY=$(settings get global verifier_verify_adb_installs)
+settings put global verifier_verify_adb_installs 0
+
+#------------------------------------------------------------------------------
+
+## Uninstall previous apps and binaries module if they are installed
+ui_print "* Checking for legacy version of NetHunter"
+pm uninstall com.offsec.nethunter &>/dev/null || true
+pm uninstall com.offsec.nethunter.kex &>/dev/null || true
+pm uninstall com.offsec.nhterm &>/dev/null || true
+pm uninstall com.offsec.nethunter.store &>/dev/null || true
+
+## Remove Osmosis BusyBox module
+[ -d /data/adb/modules/busybox-ndk ] && {
+  ## Follow Magisk way to disable and remove modules
+  touch /data/adb/modules/busybox-ndk/disable
+  touch /data/adb/modules/busybox-ndk/remove
+}
+
+## Remove Wi-Fi firmware modules
+[ -d /data/adb/modules/wirelessFirmware ] && {
+  ## Follow Magisk way to disable and remove modules
+  touch /data/adb/modules/wirelessFirmware/disable
+  touch /data/adb/modules/wirelessFirmware/remove
+}
+
+## Remove nano modules
+[ -d /data/adb/modules/nano-ndk ] && {
+  ## Follow Magisk way to disable and remove modules
+  touch /data/adb/modules/nano-ndk/disable
+  touch /data/adb/modules/nano-ndk/remove
+}
+
+#------------------------------------------------------------------------------
+
+[ -e "$ZIPFILE" ] && {
+  ZIP=$(unzip -lqq "$ZIPFILE" | awk '$4 ~ /^supersu.zip/ { print $4; exit }')
+  [ "$ZIP" ] && {
+    ui_print "* [!] SuperSU.zip is not supported with Magisk"
+  }
+}
+
+#------------------------------------------------------------------------------
+
+## Install all NetHunter apps
+##   `/system/bin/pm` is an helper-script for `/system/bin/cmd package`
+
+ui_print "* Installing apps (via system):"
+
+## Install the core NetHunter app
+ui_print "** Installing NetHunter.apk"
+pm install $TMP/data/app/NetHunter.apk &>/dev/null
+
+## NetHunter.apk depends on it
+ui_print "** Installing NetHunterTerminal.apk"
+pm install $TMP/data/app/NetHunterTerminal.apk &>/dev/null
+
+## NetHunter.apk uses it
+ui_print "** Installing NetHunterKeX.apk"
+pm install $TMP/data/app/NetHunterKeX.apk &>/dev/null
+
+## We need it
+ui_print "** Installing NetHunterStore.apk"
+pm install -g $TMP/data/app/NetHunterStore.apk &>/dev/null
+
+## NetHunterStore.apk depends on it
+ui_print "** Installing NetHunterStorePrivilegedExtension.apk"
+pm install -g $TMP/data/app/NetHunterStorePrivilegedExtension.apk &>/dev/null
+
+#ui_print "* Done installing apps"
+
+#------------------------------------------------------------------------------
+
+## Install BusyBox
+ui_print "* Setting up BusyBox"
+source $TMP/tools/install-busybox.sh || abort "! install-busybox.sh"   # Don't spawn a new session (aka using sh), do in current session (able to pass variables/functions)
+#print "* Done installing BusyBox"
+
+#------------------------------------------------------------------------------
+
+## Setup Kali NetHunter wallpaper of correct resolution if there is one available
+if [ -d $TMP/wallpaper ]; then
+  ui_print "* Running Kali NetHunter wallpaper script" # Installing Kali NetHunter wallpaper
+  source $TMP/tools/set-wallpaper.sh || true   # Don't spawn a new session (aka using sh), do in current session (able to pass variables/functions)
+else
+  ui_print "- Skipping wallpaper"
+fi
+
+#------------------------------------------------------------------------------
+
+## Install NetHunter boot animation
+[ -f $TMP/system/media/bootanimation.zip ] && {
+  ui_print "* Installing Kali NetHunter boot animation"
+  mkdir -p $MEDIA
+  cp $TMP/system/media/bootanimation.zip $MEDIA
+}
+
+## Install required firmwares, binaries, lib files for Kali NetHunter
+[ -d $TMP/system/etc/nano ] && {
+  ui_print "* Copying nano highlights to /system/etc/nano"
+  mkdir -p $ETC
+  cp -r "$TMP/system/etc/nano" "$ETC/"
+  set_perm_recursive "$ETC/nano" 0 0 0755 0644
+}
+
+[ -d $TMP/system/etc/terminfo ] && {
+  ui_print "* Copying terminfo files to /system/etc/terminfo"
+  mkdir -p $ETC
+  cp -r "$TMP/system/etc/terminfo" "$ETC/"
+  set_perm_recursive "$ETC/terminfo" 0 0 0755 0644
+}
+
+[ -d $TMP/boot-patcher/system/etc/firmware ] && {
+  ui_print "* Copying Wi-Fi firmwares to /system/etc/firmware"
+  mkdir -p $ETC
+  cp -r "$TMP/boot-patcher/system/etc/firmware" "$ETC/"
+  set_perm_recursive "$ETC/firmware" 0 0 0755 0644
+}
+
+[ -d $TMP/system/lib ] && {
+  ui_print "* Copying 32-bit shared libraries to /system/lib"
+  mkdir -p "$TARGET"
+  cp -r "$TMP/system/lib" "$TARGET/"
+  set_perm_recursive "$TARGET/lib" 0 0 0755 0644
+}
+
+[ -d $TMP/system/lib64 ] && {
+  ui_print "* Copying 64-bit shared libraries to /system/lib64"
+  mkdir -p "$TARGET"
+  cp -r "$TMP/system/lib64" "$TARGET/"
+  set_perm_recursive "$TARGET/lib64" 0 0 0755 0644
+}
+
+[ -d $TMP/system/bin ] && {
+  ui_print "* Installing /system/bin binaries"
+  mkdir -p "$TARGET"
+  cp -r "$TMP/system/bin" "$TARGET/"
+  set_perm_recursive "$BIN" 0 0 0755 0755
+}
+
+[ -d $TMP/boot-patcher/system/xbin ] && {
+  ui_print "* Installing hid-keyboard to /system/xbin"
+  mkdir -p "$XBIN"
+  cp -r $TMP/boot-patcher/system/xbin/* "$XBIN/"
+  set_perm_recursive "$XBIN" 0 0 0755 0755
+}
+
+[ -d $TMP/data/local ] && {
+  ui_print "* Copying additional files to /data/local"
+  mkdir -p /data/local
+  cp -r $TMP/data/local/* "/data/local/"
+  set_perm_recursive "/data/local" 0 0 0755 0644
+}
+
+[ -d $TMP/system/etc/init.d ] && {
+  ui_print "* Installing init.d scripts"
+  cp -r "$TMP/system/etc/init.d" "$ETC/"
+
+  ## Create userinit.d and userinit.sh if they don't already exist
+  ui_print "* Installing userinit.d scripts"
+  rm -rf /data/local/userinit.d # Remove previous one
+  mkdir -p "/data/local/userinit.d"
+  [ -f "/data/local/userinit.sh" ] || echo "#!/system/bin/sh" > "/data/local/userinit.sh"
+  chmod 0755 "/data/local/userinit.sh"
+  set_perm_recursive "$ETC/init.d" 0 0 0755 0644
+}
+
+[ -e $TMP/system/addon.d/80-nethunter.sh ] && {
+  ui_print "* Installing /system/addon.d backup scripts"
+  mkdir -p "$TARGET/addon.d"
+  cp "$TMP/system/addon.d/80-nethunter.sh" "$TARGET/addon.d/"
+  set_perm_recursive "$TARGET/addon.d" 0 0 0755 0644
+}
+
+#------------------------------------------------------------------------------
+
+## Symlink bootkali* scripts for using in another terminals
+## May need to start up NetHunter.apk first!
+if [ -e /data/data/com.offsec.nethunter/assets/scripts/ ]; then
+  ui_print "* Symlinking NetHunter.apk boot scripts"
+  mkdir -p "$BIN"
+  symlink "/data/data/com.offsec.nethunter/assets/scripts/bootkali"       "$TARGET/bin/bootkali"       || ui_print "[!] Missing bootkali"
+  symlink "/data/data/com.offsec.nethunter/assets/scripts/bootkali_init"  "$TARGET/bin/bootkali_init"  || ui_print "[!] Missing bootkali_init"
+  symlink "/data/data/com.offsec.nethunter/assets/scripts/bootkali_login" "$TARGET/bin/bootkali_login" || ui_print "[!] Missing bootkali_login"
+  symlink "/data/data/com.offsec.nethunter/assets/scripts/bootkali_bash"  "$TARGET/bin/bootkali_bash"  || ui_print "[!] Missing bootkali_bash"
+  symlink "/data/data/com.offsec.nethunter/assets/scripts/killkali"       "$TARGET/bin/killkali"       || ui_print "[!] Missing killkali"
+else
+  ui_print "[!] Skipping bootkali symlinks (NetHunter app data not present yet)"
+fi
+[ -d "$BIN" ] && set_perm_recursive "$BIN" 0 0 0755 0755
+
+#------------------------------------------------------------------------------
+
+## Adding required permissions for apps
+ui_print "* Granting required permissions to apps"
+## $ aapt d permissions ./data/apps/NetHunter.apk
+##   Working on LineageOS 18.1/Android 11 (OnePlus 1 64GB)
+for x in ACCESS_BACKGROUND_LOCATION \
+         ACCESS_COARSE_LOCATION \
+         ACCESS_FINE_LOCATION \
+         READ_EXTERNAL_STORAGE \
+         WRITE_EXTERNAL_STORAGE \
+         WRITE_SECURE_SETTINGS; do
+  pm grant -g com.offsec.nethunter android.permission.$x 2>/dev/null && echo "** $x success" >&2 || echo "** ! $x failed" >&2
+done
+
+## $ aapt d permissions ./data/apps/NetHunter.apk                           # com.offsec.nethunter_2024040100.apk
+# uses-permission: name='android.permission.ACCESS_BACKGROUND_LOCATION'
+# uses-permission: name='android.permission.ACCESS_COARSE_LOCATION'
+# uses-permission: name='android.permission.ACCESS_FINE_LOCATION'
+# uses-permission: name='android.permission.ACCESS_NETWORK_STATE'
+# uses-permission: name='android.permission.ACCESS_NOTIFICATION_POLICY'
+# uses-permission: name='android.permission.ACCESS_WIFI_STATE'
+# uses-permission: name='android.permission.BIND_ACCESSIBILITY_SERVICE'
+# uses-permission: name='android.permission.BLUETOOTH'
+# uses-permission: name='android.permission.BLUETOOTH_ADMIN'
+# uses-permission: name='android.permission.BLUETOOTH_CONNECT'
+# uses-permission: name='android.permission.BLUETOOTH_PRIVILEGED'
+# uses-permission: name='android.permission.CHANGE_NETWORK_STATE'
+# uses-permission: name='android.permission.CHANGE_WIFI_MULTICAST_STATE'
+# uses-permission: name='android.permission.CHANGE_WIFI_STATE'
+# uses-permission: name='android.permission.FOREGROUND_SERVICE'
+# uses-permission: name='android.permission.INTERNET'
+# uses-permission: name='android.permission.POST_NOTIFICATIONS'
+# uses-permission: name='android.permission.READ_EXTERNAL_STORAGE'
+# uses-permission: name='android.permission.RECEIVE_BOOT_COMPLETED'
+# uses-permission: name='android.permission.VIBRATE'
+# uses-permission: name='android.permission.WAKE_LOCK'
+# uses-permission: name='android.permission.WRITE_EXTERNAL_STORAGE'
+# uses-permission: name='android.permission.WRITE_SECURE_SETTINGS'
+# uses-permission: name='android.permission.WRITE_SETTINGS'
+# uses-permission: name='com.offsec.nethunter.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION'
+# permission: com.offsec.nethunter.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION
+
+## $ aapt d permissions ./data/apps/NetHunterKeX.apk                        # com.offsec.nethunter.kex_11525001.apk
+# uses-permission: name='android.permission.ACCESS_NETWORK_STATE'
+# uses-permission: name='android.permission.INTERNET'
+# uses-permission: name='android.permission.VIBRATE'
+
+## $ aapt d permissions ./data/apps/NetHunterStore.apk                      # com.offsec.nethunter.store_2019030201.apk
+# uses-permission: name='android.permission.ACCESS_NETWORK_STATE'
+# uses-permission: name='android.permission.ACCESS_WIFI_STATE'
+# uses-permission: name='android.permission.BLUETOOTH'
+# uses-permission: name='android.permission.BLUETOOTH_ADMIN'
+# uses-permission: name='android.permission.CHANGE_NETWORK_STATE'
+# uses-permission: name='android.permission.CHANGE_WIFI_MULTICAST_STATE'
+# uses-permission: name='android.permission.CHANGE_WIFI_STATE'
+# uses-permission: name='android.permission.INTERNET'
+# uses-permission: name='android.permission.NFC'
+# uses-permission: name='android.permission.READ_EXTERNAL_STORAGE'
+# uses-permission: name='android.permission.RECEIVE_BOOT_COMPLETED'
+# uses-permission: name='android.permission.WAKE_LOCK'
+# uses-permission: name='android.permission.WRITE_EXTERNAL_STORAGE'
+# uses-permission: name='android.permission.WRITE_SETTINGS'
+# uses-permission-sdk-23: name='android.permission.ACCESS_COARSE_LOCATION'
+
+## $ aapt d permissions ./data/apps/NetHunterStorePrivilegedExtension.apk   # com.offsec.nethunter.store.privileged_2130.apk
+# uses-permission: name='android.permission.DELETE_PACKAGES'
+# uses-permission: name='android.permission.INSTALL_PACKAGES'
+
+## $ aapt d permissions ./data/apps/NetHunterTerminal.apk                   # com.offsec.nhterm_2023040100.apk
+# uses-permission: name='android.permission.ACCESS_NETWORK_STATE'
+# uses-permission: name='android.permission.FOREGROUND_SERVICE'
+# uses-permission: name='android.permission.INTERNET'
+# uses-permission: name='android.permission.MANAGE_EXTERNAL_STORAGE'
+# uses-permission: name='android.permission.READ_EXTERNAL_STORAGE'
+# uses-permission: name='android.permission.READ_LOGS'
+# uses-permission: name='android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS'
+# uses-permission: name='android.permission.VIBRATE'
+# uses-permission: name='android.permission.WAKE_LOCK'
+# uses-permission: name='android.permission.WRITE_EXTERNAL_STORAGE'
+
+#------------------------------------------------------------------------------
+
+## Install modules
+ui_print "* Pushing modules"
+push_modules || ui_print "[!] Failed to push modules"
+
+#------------------------------------------------------------------------------
+
+## Install kernel
+ui_print "* Flashing kernel"
+flash_kernel || ui_print "[!] Failed to flash kernel"
+
+#------------------------------------------------------------------------------
+
+## Install Kali chroot
+ui_print "* Installing Kali chroot"
+## install-chroot.sh uses $BB for tar; the recovery flow sets it via get_bb()
+## but this module flow never did - use the NetHunter BusyBox we just installed
+BB=$(ls $XBIN/busybox_nh-* 2>/dev/null | sort -t- -k3 -n | tail -n 1)
+[ -x "$BB" ] || BB=tar
+source $TMP/tools/install-chroot.sh || abort "! install-chroot.sh"   # Don't spawn a new session (aka using sh), do in current session (able to pass variables/functions)
+#print "* Done installing Kali chroot"
+
+#------------------------------------------------------------------------------
+
+## Random important Magisk stuff (Don't remove)
+## KernelSU: the shim already manages module.prop / post-fs-data.sh / service
+## marker files; duplicating them into the "live" modules dir mid-install
+## would confuse the manager's bookkeeping.
+if ! $KSU_INSTALL; then
+  ui_print "* Important Magisk items"
+  cp -fp $TMP/module.prop $MNT/$MODID/
+  cp -fp $TMP/post-fs-data.sh $MNT/$MODID/
+  touch $MNT/$MODID/auto_mount
+  [ -e /data/adb/modules ] && IMGMNT=/data/adb/modules
+  mkdir -p "$IMGMNT/$MODID"
+  touch "$IMGMNT/$MODID/update"
+  cp -fp $TMP/module.prop "$IMGMNT/$MODID/"
+fi
+
+#------------------------------------------------------------------------------
+
+ui_print "* Restoring environment"
+cd /
+
+## Restore environment after installations
+if ! $KSU_INSTALL; then
+  if [ -d /dev/block/mapper ]; then
+    for block in system; do
+      for slot in "" _a _b; do
+        blockdev --setro /dev/block/mapper/$block$slot 2>/dev/null
+      done
+    done
+  fi
+  [ "$SAR" ] && mount -o ro,remount -t auto / || mount -o ro,remount -t auto /system
+fi
+
+## Restore also additional settings we did before
+settings put global verifier_verify_adb_installs $VERIFY
+$ENFORCE && setenforce 1
+
+## Handle replace folders
+for TARGET in ${REPLACE:-}; do
+  ui_print "* Replace target: $TARGET"
+  mktouch $MODPATH$TARGET/.replace
+done
+
+#------------------------------------------------------------------------------
+
+## Clean up
+ui_print "* Cleaning up"
+[ -n "$DEBUG" ] || rm -rf $TMPDIR
+umask $UMASK
+
+## Done
+
+#------------------------------------------------------------------------------
+
+#<REF: ./scripts/util_functions.sh>
+## Update info for Magisk
+## KernelSU: skip - the shim owns these marker files
+if ! $KSU_INSTALL; then
+  print "* Setting Magisk metadata"
+  mktouch /data/adb/modules/$MODID/update
+  rm -rf /data/adb/modules/$MODID/remove 2>/dev/null
+  rm -rf /data/adb/modules/$MODID/disable 2>/dev/null
+  cp -af $MODPATH/module.prop /data/adb/modules/$MODID/module.prop
+
+  ## Copy over custom sepolicy rules
+  if [ -f $MODPATH/sepolicy.rule ]; then
+    print "* Installing custom sepolicy rules"
+    copy_preinit_files
+  fi
+fi
+
+## Remove stuff that doesn't belong to modules and clean up any empty directories
+rm -rf $MODPATH/update-magisk \
+       $MODPATH/system/placeholder \
+       $MODPATH/customize.sh \
+       $MODPATH/README.md \
+       $MODPATH/.git*
+## KernelSU: the module overlay only mounts $MODPATH/system; the apks were
+## already installed via pm and the raw copies in $MODPATH/data are dead weight
+if $KSU_INSTALL; then
+  rm -rf $MODPATH/data
+fi
+#rmdir -p $MODPATH 2>/dev/null
+
+cd /
+[ -n "$DEBUG" ] || rm -rf $TMPDIR
+#</REF: ./scripts/util_functions.sh>
