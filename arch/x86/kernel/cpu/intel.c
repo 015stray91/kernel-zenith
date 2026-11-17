@@ -304,7 +304,7 @@ static void early_init_intel(struct cpuinfo_x86 *c)
 	switch (c->x86_vfm) {
 	case INTEL_ATOM_SILVERMONT:
 		set_cpu_cap(c, X86_FEATURE_TSC_RELIABLE);
-		/* Fall through */
+		fallthrough;
 	case INTEL_ATOM_SALTWELL_MID:
 	case INTEL_ATOM_SALTWELL_TABLET:
 	case INTEL_ATOM_SILVERMONT_MID:
